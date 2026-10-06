@@ -48,6 +48,28 @@ def audit(frames, window=12):
     return audit_request({"frames": frames, "maxWindow": window})
 
 
+def audit_ev(frames, max_delay, capture_end=None, window=12):
+    evidence = {"maxDelayUs": max_delay}
+    if capture_end is not None:
+        evidence["captureEndAtUs"] = capture_end
+    return audit_request(
+        {"frames": frames, "maxWindow": window, "ackEvidence": evidence}
+    )
+
+
+def expect_error_ev(frames, max_delay, capture_end, code: ErrorCode, index: int,
+                    window=12):
+    try:
+        audit_ev(frames, max_delay, capture_end, window)
+    except AuditError as exc:
+        assert exc.code is code, f"期望 {code}，实际 {exc.code}"
+        assert exc.frame_index == index, (
+            f"期望下标 {index}，实际 {exc.frame_index}（{exc.message}）"
+        )
+        return exc
+    raise AssertionError(f"应当抛出 {code}，但核验通过了")
+
+
 def expect_error(frames, code: ErrorCode, index: int, window=12):
     try:
         audit(frames, window)
@@ -421,6 +443,279 @@ class RequestValidationTests(unittest.TestCase):
         with self.assertRaises(AuditError) as cm:
             audit_request({"frames": [{"direction": "client"}], "maxWindow": 12})
         self.assertEqual(cm.exception.frame_index, 0)
+
+
+class AckEvidenceTests(unittest.TestCase):
+    def _started(self, t0=0, t1=0):
+        return [
+            f("client", STARTDT_ACT, t0),
+            f("server", STARTDT_CON, t1),
+        ]
+
+    def test_omitted_evidence_keeps_old_contract(self):
+        # 不带 ackEvidence 时允许缺时间戳，响应也不含证据字段。
+        frames = [
+            f("client", STARTDT_ACT),
+            f("server", STARTDT_CON),
+            f("client", i_frame(0, 0)),
+            f("server", s_frame(1)),
+        ]
+        result = audit(frames)["result"]
+        self.assertNotIn("ackEvidence", result)
+
+    def test_cumulative_s_ack_covers_each_frame(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 200),
+            f("client", i_frame(2, 0), 300),
+            f("server", s_frame(3), 350),
+        ]
+        result = audit_ev(frames, 1000, 400)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [
+                {"sendFrameIndex": 2, "firstAckFrameIndex": 5, "delayUs": 250},
+                {"sendFrameIndex": 3, "firstAckFrameIndex": 5, "delayUs": 150},
+                {"sendFrameIndex": 4, "firstAckFrameIndex": 5, "delayUs": 50},
+            ],
+        )
+        self.assertEqual(result["ackEvidence"]["server"], [])
+
+    def test_piggybacked_and_bidirectional_acks(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", i_frame(0, 1), 200),   # 捎带确认 client I0
+            f("client", i_frame(1, 1), 300),   # 捎带确认 server I0
+            f("server", s_frame(2), 400),      # 确认 client I1
+        ]
+        result = audit_ev(frames, 1000, 500)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [
+                {"sendFrameIndex": 2, "firstAckFrameIndex": 3, "delayUs": 100},
+                {"sendFrameIndex": 4, "firstAckFrameIndex": 5, "delayUs": 100},
+            ],
+        )
+        self.assertEqual(
+            result["ackEvidence"]["server"],
+            [{"sendFrameIndex": 3, "firstAckFrameIndex": 4, "delayUs": 100}],
+        )
+
+    def test_partial_cumulative_acks_attach_to_first_crossing(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 150),       # 仅越过 N(S)=0
+            f("client", i_frame(1, 0), 200),
+            f("client", i_frame(2, 0), 300),
+            f("server", s_frame(3), 320),       # 首次越过 N(S)=1、2
+        ]
+        result = audit_ev(frames, 1000, 400)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [
+                {"sendFrameIndex": 2, "firstAckFrameIndex": 3, "delayUs": 50},
+                {"sendFrameIndex": 4, "firstAckFrameIndex": 6, "delayUs": 120},
+                {"sendFrameIndex": 5, "firstAckFrameIndex": 6, "delayUs": 20},
+            ],
+        )
+
+    def test_delay_exactly_at_limit_is_legal(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 1100),  # 时延恰好 1000 μs
+        ]
+        result = audit_ev(frames, 1000, 1200)["result"]
+        self.assertEqual(result["ackEvidence"]["client"][0]["delayUs"], 1000)
+
+    def test_late_ack_at_arrival_points_at_earliest_send_frame(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 1050),
+            # 同一累计确认：I0 等待 1001 μs 超时；I1 仅 51 μs
+            f("server", s_frame(2), 1101),
+        ]
+        expect_error_ev(frames, 1000, 2000, ErrorCode.I_ACK_TIMEOUT, 2)
+
+    def test_later_frame_can_be_the_first_timeout(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 200),       # I0 100 μs，合法
+            f("client", i_frame(1, 0), 300),
+            f("server", s_frame(2), 2000),      # I1 等待 1700 μs，超时
+        ]
+        expect_error_ev(frames, 1000, 3000, ErrorCode.I_ACK_TIMEOUT, 4)
+
+    def test_timeout_uses_frame_timestamp_not_capture_end(self):
+        # 确认帧本身到达即超时，即使 captureEndAtUs 更晚也定位发送帧
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 1_000_000),
+        ]
+        expect_error_ev(frames, 1000, 2_000_000, ErrorCode.I_ACK_TIMEOUT, 2)
+
+    def test_unacked_within_limit_at_capture_end_is_legal(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 200),
+            f("server", s_frame(1), 300),       # 仅确认 I0
+        ]
+        # I1 到 captureEnd 恰好 900 μs，未超 1000，合法但不列入证据
+        result = audit_ev(frames, 1000, 1100)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [{"sendFrameIndex": 2, "firstAckFrameIndex": 4, "delayUs": 200}],
+        )
+        self.assertEqual(result["outstanding"]["client"], 1)
+
+    def test_unacked_overdue_at_capture_end_times_out(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 200),
+            f("server", s_frame(1), 300),
+        ]
+        # I1 到 captureEnd 已 1001 μs，超时，定位最早超时发送帧 I1
+        expect_error_ev(frames, 1000, 1201, ErrorCode.I_ACK_TIMEOUT, 3)
+
+    def test_unacked_exactly_at_limit_at_capture_end_is_legal(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+        ]
+        # captureEnd - 发送时刻恰好等于上限，合法
+        result = audit_ev(frames, 1000, 1100)["result"]
+        self.assertEqual(result["ackEvidence"]["client"], [])
+
+    def test_earliest_overdue_unacked_is_reported(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 200),
+            f("server", i_frame(0, 0), 300),
+        ]
+        # client I0 与 server I0 均未确认，client I0(下标2) 最早超时
+        expect_error_ev(frames, 1000, 2000, ErrorCode.I_ACK_TIMEOUT, 2)
+
+    def test_without_capture_end_unacked_never_times_out(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+        ]
+        # 未提供 captureEndAtUs：无论末帧后多久都不判超时
+        result = audit_ev(frames, 1)["result"]
+        self.assertEqual(result["ackEvidence"]["client"], [])
+
+    def test_capture_end_equal_to_last_frame_allowed(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 100),
+        ]
+        result = audit_ev(frames, 1000, 100)["result"]
+        self.assertEqual(result["ackEvidence"]["client"][0]["delayUs"], 0)
+
+    def test_protocol_violation_still_reported_before_end_timeout(self):
+        # 末帧确认号越界，应在处理中报 ACK_AHEAD 而非结束时的超时
+        frames = self._started() + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(2), 200),
+        ]
+        expect_error_ev(frames, 1, 300, ErrorCode.ACK_AHEAD, 3)
+
+    def test_end_timeout_earliest_vs_unmatched_handshake(self):
+        # I0 超时（下标 1）早于未配对 STOPDT act（下标 3），报更早者
+        frames = [
+            f("client", STARTDT_ACT, 0),
+            f("server", STARTDT_CON, 0),
+            f("client", i_frame(0, 0), 100),
+            f("client", STOPDT_ACT, 2000),
+        ]
+        expect_error_ev(frames, 1000, 3000, ErrorCode.I_ACK_TIMEOUT, 2)
+
+    def test_unmatched_handshake_can_be_earliest(self):
+        # 未配对的 TESTFR act（下标 0）早于超时的 I 帧（下标 3），报更早者
+        frames = [
+            f("client", TESTFR_ACT, 0),
+            f("client", STARTDT_ACT, 0),
+            f("server", STARTDT_CON, 0),
+            f("client", i_frame(0, 0), 100),
+        ]
+        expect_error_ev(frames, 1000, 3000, ErrorCode.HANDSHAKE_UNMATCHED, 0)
+
+
+class AckEvidenceValidationTests(unittest.TestCase):
+    def _started(self):
+        return [
+            f("client", STARTDT_ACT, 0),
+            f("server", STARTDT_CON, 0),
+        ]
+
+    def test_all_frames_require_timestamp(self):
+        frames = self._started() + [
+            f("client", i_frame(0, 0)),  # 缺少 capturedAtUs
+        ]
+        with self.assertRaises(AuditError) as cm:
+            audit_ev(frames, 1000, 100)
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        self.assertEqual(cm.exception.frame_index, 2)
+
+    def test_u_frame_also_requires_timestamp(self):
+        frames = [f("client", STARTDT_ACT)]  # U 帧也不能缺
+        with self.assertRaises(AuditError) as cm:
+            audit_ev(frames, 1000, 100)
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        self.assertEqual(cm.exception.frame_index, 0)
+
+    def test_max_delay_bounds(self):
+        frames = self._started()
+        for bad in (0, -1, 60_000_001, 10**12):
+            with self.assertRaises(AuditError) as cm:
+                audit_ev(frames, bad, 100)
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST,
+                             f"bad={bad}")
+            self.assertEqual(cm.exception.frame_index, -1)
+
+    def test_max_delay_boundaries_accepted(self):
+        frames = self._started()
+        for good in (1, 60_000_000):
+            audit_ev(frames, good, good)
+
+    def test_max_delay_wrong_type(self):
+        for bad in (True, "1000", 1.5, None):
+            body = {
+                "frames": self._started(),
+                "maxWindow": 12,
+                "ackEvidence": {"maxDelayUs": bad, "captureEndAtUs": 1},
+            }
+            with self.assertRaises(AuditError) as cm:
+                audit_request(body)
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_max_delay_missing(self):
+        body = {"frames": self._started(), "maxWindow": 12,
+                "ackEvidence": {"captureEndAtUs": 1}}
+        with self.assertRaises(AuditError) as cm:
+            audit_request(body)
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_ack_evidence_must_be_object(self):
+        body = {"frames": self._started(), "maxWindow": 12,
+                "ackEvidence": [1000]}
+        with self.assertRaises(AuditError) as cm:
+            audit_request(body)
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_capture_end_before_last_frame_rejected(self):
+        frames = self._started() + [f("client", i_frame(0, 0), 500)]
+        with self.assertRaises(AuditError) as cm:
+            audit_ev(frames, 1000, 499)  # 早于末帧 500
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+
+    def test_capture_end_wrong_type(self):
+        for bad in (True, "100", -1):
+            body = {
+                "frames": self._started(),
+                "maxWindow": 12,
+                "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": bad},
+            }
+            with self.assertRaises(AuditError) as cm:
+                audit_request(body)
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
 
 
 if __name__ == "__main__":

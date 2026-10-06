@@ -16,6 +16,8 @@ MAX_LENGTH_FIELD = 253  # 长度字段 = 控制域(4) + ASDU(<=249)
 MAX_FRAMES = 5000
 MIN_WINDOW = 1
 MAX_WINDOW = 16383
+MIN_ACK_DELAY_US = 1
+MAX_ACK_DELAY_US = 60_000_000
 
 CLIENT = "client"
 SERVER = "server"
@@ -48,6 +50,7 @@ class ErrorCode(str, Enum):
     HANDSHAKE_UNMATCHED = "HANDSHAKE_UNMATCHED"
     HANDSHAKE_OVERLAP = "HANDSHAKE_OVERLAP"
     I_FRAME_OUTSIDE_PHASE = "I_FRAME_OUTSIDE_PHASE"
+    I_ACK_TIMEOUT = "I_ACK_TIMEOUT"
 
 
 # 请求结构问题属于 400；其余为可定位到帧的协议违规，属于 422。
@@ -63,6 +66,7 @@ _HTTP_STATUS = {
     ErrorCode.HANDSHAKE_UNMATCHED: 422,
     ErrorCode.HANDSHAKE_OVERLAP: 422,
     ErrorCode.I_FRAME_OUTSIDE_PHASE: 422,
+    ErrorCode.I_ACK_TIMEOUT: 422,
 }
 
 
@@ -201,9 +205,21 @@ def parse_apdu(raw_hex: object) -> ParsedFrame:
 
 
 @dataclass
+class _SentIRecord:
+    """一帧已发送 I 帧的确认证据（仅启用 ackEvidence 时使用）。"""
+
+    index: int  # 该发送帧在请求 frames 中的下标
+    captured_at: int
+    ack_index: Optional[int] = None  # 首次越过其 N(S) 的对端 I/S 帧下标
+    delay_us: Optional[int] = None  # 两帧 capturedAtUs 之差
+
+
+@dataclass
 class _PeerState:
     next_send: int = 0  # 本端下一个应使用的 N(S)，双方均从 0 起
     last_ack: int = 0  # 本端已发布的最大 N(R)，确认号不得倒退
+    # 按 N(S) 顺序记录本端发送的 I 帧，下标即发送序号；仅证据模式填充。
+    sent: Optional[list[_SentIRecord]] = None
 
 
 def _opposite(direction: str) -> str:
@@ -239,6 +255,8 @@ def audit_request(body: object) -> dict:
             f"frames 数量超过上限 {MAX_FRAMES}",
         )
 
+    max_delay_us, capture_end_at_us = _parse_ack_evidence(body.get("ackEvidence"))
+
     frames: list[tuple[str, Optional[int], ParsedFrame]] = []
     previous_ts: Optional[int] = None
     for index, item in enumerate(raw_frames):
@@ -254,25 +272,32 @@ def audit_request(body: object) -> dict:
                 "direction 必须为 client 或 server（也接受 master/slave 等别名）",
             )
         captured_at = item.get("capturedAtUs")
+        if captured_at is None:
+            if max_delay_us is not None:
+                raise AuditError(
+                    ErrorCode.INVALID_REQUEST,
+                    index,
+                    "启用 ackEvidence 后每一帧都必须提供整数 capturedAtUs",
+                )
+        elif isinstance(captured_at, bool) or not isinstance(captured_at, int):
+            raise AuditError(
+                ErrorCode.INVALID_REQUEST,
+                index,
+                "capturedAtUs 必须为整数微秒时间戳",
+            )
+        elif captured_at < 0:
+            raise AuditError(
+                ErrorCode.INVALID_REQUEST,
+                index,
+                "capturedAtUs 不能为负数",
+            )
+        elif previous_ts is not None and captured_at < previous_ts:
+            raise AuditError(
+                ErrorCode.FRAMES_NOT_ORDERED,
+                index,
+                "capturedAtUs 早于之前的帧，帧未按非递减顺序排列",
+            )
         if captured_at is not None:
-            if isinstance(captured_at, bool) or not isinstance(captured_at, int):
-                raise AuditError(
-                    ErrorCode.INVALID_REQUEST,
-                    index,
-                    "capturedAtUs 必须为整数微秒时间戳",
-                )
-            if captured_at < 0:
-                raise AuditError(
-                    ErrorCode.INVALID_REQUEST,
-                    index,
-                    "capturedAtUs 不能为负数",
-                )
-            if previous_ts is not None and captured_at < previous_ts:
-                raise AuditError(
-                    ErrorCode.FRAMES_NOT_ORDERED,
-                    index,
-                    "capturedAtUs 早于之前的帧，帧未按非递减顺序排列",
-                )
             previous_ts = captured_at
         try:
             parsed = parse_apdu(item.get("apdu"))
@@ -281,13 +306,77 @@ def audit_request(body: object) -> dict:
             raise AuditError(exc.code, index, exc.message) from None
         frames.append((direction, captured_at, parsed))
 
-    return _audit(frames, max_window)
+    if capture_end_at_us is not None:
+        last_ts = frames[-1][1]
+        assert last_ts is not None  # 启用证据模式后所有帧均有时间戳
+        if capture_end_at_us < last_ts:
+            raise AuditError(
+                ErrorCode.INVALID_REQUEST,
+                -1,
+                "ackEvidence.captureEndAtUs 不得早于末帧的 capturedAtUs",
+            )
+
+    return _audit(frames, max_window, max_delay_us, capture_end_at_us)
+
+
+def _parse_ack_evidence(
+    raw: object,
+) -> tuple[Optional[int], Optional[int]]:
+    """解析可选的 ackEvidence，返回 (maxDelayUs, captureEndAtUs)。
+
+    省略该字段时返回 (None, None)，既有契约不变；字段存在但必须为 JSON 对象，
+    maxDelayUs 必填且取 1..60_000_000 的整数；captureEndAtUs 为可选非负整数。
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        raise AuditError(
+            ErrorCode.INVALID_REQUEST, -1, "ackEvidence 必须为 JSON 对象"
+        )
+
+    max_delay = raw.get("maxDelayUs")
+    if isinstance(max_delay, bool) or not isinstance(max_delay, int):
+        raise AuditError(
+            ErrorCode.INVALID_REQUEST,
+            -1,
+            "ackEvidence.maxDelayUs 必须为 1..%d 的整数" % MAX_ACK_DELAY_US,
+        )
+    if not (MIN_ACK_DELAY_US <= max_delay <= MAX_ACK_DELAY_US):
+        raise AuditError(
+            ErrorCode.INVALID_REQUEST,
+            -1,
+            f"ackEvidence.maxDelayUs 必须在 {MIN_ACK_DELAY_US}..{MAX_ACK_DELAY_US} 之间",
+        )
+
+    capture_end = raw.get("captureEndAtUs")
+    if capture_end is None:
+        return max_delay, None
+    if isinstance(capture_end, bool) or not isinstance(capture_end, int):
+        raise AuditError(
+            ErrorCode.INVALID_REQUEST,
+            -1,
+            "ackEvidence.captureEndAtUs 必须为整数微秒时间戳",
+        )
+    if capture_end < 0:
+        raise AuditError(
+            ErrorCode.INVALID_REQUEST,
+            -1,
+            "ackEvidence.captureEndAtUs 不能为负数",
+        )
+    return max_delay, capture_end
 
 
 def _audit(
-    frames: list[tuple[str, Optional[int], ParsedFrame]], max_window: int
+    frames: list[tuple[str, Optional[int], ParsedFrame]],
+    max_window: int,
+    max_delay_us: Optional[int] = None,
+    capture_end_at_us: Optional[int] = None,
 ) -> dict:
-    states = {CLIENT: _PeerState(), SERVER: _PeerState()}
+    evidence_on = max_delay_us is not None
+    states = {
+        CLIENT: _PeerState(sent=[] if evidence_on else None),
+        SERVER: _PeerState(sent=[] if evidence_on else None),
+    }
     # 每类 U 服务至多一个待配对 act：(发起方向, 帧下标)。
     pending: dict[str, Optional[tuple[str, int]]] = {
         "STARTDT": None,
@@ -302,7 +391,7 @@ def _audit(
     }
     started = False
 
-    for index, (direction, _captured_at, frame) in enumerate(frames):
+    for index, (direction, captured_at, frame) in enumerate(frames):
         peer = states[direction]
         remote = states[_opposite(direction)]
 
@@ -326,6 +415,7 @@ def _audit(
         # I/S 帧均携带 N(R)，先核验确认号。
         assert frame.recv_seq is not None
         ack = frame.recv_seq
+        previous_ack = peer.last_ack
         if ack < peer.last_ack:
             raise AuditError(
                 ErrorCode.ACK_BACKWARDS,
@@ -341,6 +431,23 @@ def _audit(
             )
         peer.last_ack = ack
 
+        # 证据模式：N(R) 首次越过某发送序号即认定对应 I 帧获确认。
+        # sent 严格按 N(S) 追加，故切片 [previous_ack, ack) 即本帧新覆盖的帧。
+        if evidence_on and ack > previous_ack:
+            assert captured_at is not None
+            assert remote.sent is not None
+            for record in remote.sent[previous_ack:ack]:
+                delay = captured_at - record.captured_at
+                record.ack_index = index
+                record.delay_us = delay
+                if delay > max_delay_us:
+                    raise AuditError(
+                        ErrorCode.I_ACK_TIMEOUT,
+                        record.index,
+                        f"该 I 帧在发送 {delay} μs 后才获得对端首次确认，"
+                        f"超过 maxDelayUs={max_delay_us}",
+                    )
+
         if frame.kind == "S":
             continue
 
@@ -353,6 +460,12 @@ def _audit(
             )
         peer.next_send += 1
         counts["i"][direction] += 1
+        if evidence_on:
+            assert captured_at is not None
+            assert peer.sent is not None
+            peer.sent.append(
+                _SentIRecord(index=index, captured_at=captured_at)
+            )
 
         outstanding = peer.next_send - remote.last_ack
         if outstanding > max_window:
@@ -363,43 +476,75 @@ def _audit(
                 f"超过最大未确认窗口 {max_window}",
             )
 
-    # 会话结束时仍有 act 未与相反方向 con 配对：定位最早的未配对 act。
-    earliest: Optional[tuple[int, str]] = None
+    # 会话结束类违规统一取最早受影响帧：
+    # 1) 仍有 act 未与相反方向 con 配对；2) 截至 captureEndAtUs 仍超时未确认。
+    end_errors: list[AuditError] = []
     for u_type, mark in pending.items():
         if mark is not None:
             act_index = mark[1]
-            if earliest is None or act_index < earliest[0]:
-                earliest = (
+            end_errors.append(
+                AuditError(
+                    ErrorCode.HANDSHAKE_UNMATCHED,
                     act_index,
                     f"会话结束时 {u_type} act 仍未收到相反方向的 con 配对",
                 )
-    if earliest is not None:
-        raise AuditError(
-            ErrorCode.HANDSHAKE_UNMATCHED, earliest[0], earliest[1]
-        )
+            )
+    if evidence_on and capture_end_at_us is not None:
+        for direction in DIRECTIONS:
+            sent = states[direction].sent
+            assert sent is not None
+            for record in sent:
+                if record.ack_index is not None:
+                    continue
+                overdue = capture_end_at_us - record.captured_at
+                if overdue > max_delay_us:
+                    end_errors.append(
+                        AuditError(
+                            ErrorCode.I_ACK_TIMEOUT,
+                            record.index,
+                            f"截至 captureEndAtUs 该 I 帧已等待 {overdue} μs "
+                            f"仍未获得对端确认，超过 maxDelayUs={max_delay_us}",
+                        )
+                    )
+    if end_errors:
+        raise min(end_errors, key=lambda exc: exc.frame_index)
 
-    return {
-        "ok": True,
-        "result": {
-            "iFrames": {
-                CLIENT: counts["i"][CLIENT],
-                SERVER: counts["i"][SERVER],
-            },
-            "outstanding": {
-                # client 已发送但 server 尚未确认的 I 帧数，反之亦然。
-                CLIENT: states[CLIENT].next_send - states[SERVER].last_ack,
-                SERVER: states[SERVER].next_send - states[CLIENT].last_ack,
-            },
-            "handshakes": {
-                name: {
-                    "act": counts["u_act"][name],
-                    "con": counts["u_con"][name],
-                    "paired": counts["u_paired"][name],
-                }
-                for name in ("STARTDT", "STOPDT", "TESTFR")
-            },
+    result = {
+        "iFrames": {
+            CLIENT: counts["i"][CLIENT],
+            SERVER: counts["i"][SERVER],
+        },
+        "outstanding": {
+            # client 已发送但 server 尚未确认的 I 帧数，反之亦然。
+            CLIENT: states[CLIENT].next_send - states[SERVER].last_ack,
+            SERVER: states[SERVER].next_send - states[CLIENT].last_ack,
+        },
+        "handshakes": {
+            name: {
+                "act": counts["u_act"][name],
+                "con": counts["u_con"][name],
+                "paired": counts["u_paired"][name],
+            }
+            for name in ("STARTDT", "STOPDT", "TESTFR")
         },
     }
+    if evidence_on:
+        # 仅列已确认 I 帧；同一次累计/捎带确认覆盖多帧时，各帧分别保留
+        # 首次确认下标与时延，形成各自可复核的证据。
+        result["ackEvidence"] = {
+            direction: [
+                {
+                    "sendFrameIndex": record.index,
+                    "firstAckFrameIndex": record.ack_index,
+                    "delayUs": record.delay_us,
+                }
+                for record in states[direction].sent
+                if record.ack_index is not None
+            ]
+            for direction in DIRECTIONS
+        }
+
+    return {"ok": True, "result": result}
 
 
 def _apply_u(

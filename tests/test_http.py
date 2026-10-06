@@ -111,6 +111,66 @@ class HttpServerTest(unittest.TestCase):
         self.assertEqual(data["error"]["code"], "ACK_AHEAD")
         self.assertEqual(data["error"]["frameIndex"], 2)
 
+    def test_ack_evidence_success_contains_per_frame_proof(self):
+        body = {
+            "maxWindow": 4,
+            "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 500},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+                {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+                {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 200},
+                # 捎带确认：同一帧累计确认 client 的两帧
+                {"direction": "server", "apdu": i_frame(0, 2), "capturedAtUs": 300},
+                {"direction": "client", "apdu": "680401000200", "capturedAtUs": 400},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 200, data)
+        evidence = data["result"]["ackEvidence"]
+        self.assertEqual(
+            evidence["client"],
+            [
+                {"sendFrameIndex": 2, "firstAckFrameIndex": 4, "delayUs": 200},
+                {"sendFrameIndex": 3, "firstAckFrameIndex": 4, "delayUs": 100},
+            ],
+        )
+        self.assertEqual(
+            evidence["server"],
+            [{"sendFrameIndex": 4, "firstAckFrameIndex": 5, "delayUs": 100}],
+        )
+
+    def test_ack_evidence_timeout_is_422(self):
+        body = {
+            "maxWindow": 4,
+            "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 3000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+                {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+                {"direction": "server", "apdu": "680401000200",
+                 "capturedAtUs": 2000},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 422)
+        self.assertEqual(data["error"]["code"], "I_ACK_TIMEOUT")
+        self.assertEqual(data["error"]["frameIndex"], 2)
+
+    def test_ack_evidence_missing_timestamp_is_400(self):
+        body = {
+            "maxWindow": 4,
+            "ackEvidence": {"maxDelayUs": 1000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON},  # 缺时间戳
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(data["error"]["frameIndex"], 1)
+
     def test_bad_json_is_400(self):
         req = urllib.request.Request(
             self._url("/api/iec104/sessions/audit"),

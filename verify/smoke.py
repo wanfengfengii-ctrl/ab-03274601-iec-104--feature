@@ -138,6 +138,109 @@ def main() -> int:
           and err.get("frameIndex") == 0,
           f"{status} {err}")
 
+    # 5. ackEvidence：累计确认 + 捎带确认，每个被覆盖的 I 帧各自形成证据
+    evidence_session = {
+        "maxWindow": 4,
+        "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 500},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+            {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 200},
+            # server I0 捎带 N(R)=2，一次累计覆盖 client 的 I0/I1
+            {"direction": "server", "apdu": i_frame(0, 2), "capturedAtUs": 300},
+            # client S 帧确认 server 的 I0
+            {"direction": "client", "apdu": s_frame(1), "capturedAtUs": 400},
+        ],
+    }
+    status, data = post(evidence_session)
+    check("证据会话返回 200", status == 200, f"实际 {status} {data}")
+    evidence = data.get("result", {}).get("ackEvidence", {})
+    check("累计确认覆盖的两帧各自留证",
+          evidence.get("client") == [
+              {"sendFrameIndex": 2, "firstAckFrameIndex": 4, "delayUs": 200},
+              {"sendFrameIndex": 3, "firstAckFrameIndex": 4, "delayUs": 100},
+          ],
+          str(evidence.get("client")))
+    check("捎带确认同样计时",
+          evidence.get("server") == [
+              {"sendFrameIndex": 4, "firstAckFrameIndex": 5, "delayUs": 100},
+          ],
+          str(evidence.get("server")))
+
+    # 6. ackEvidence：确认时延恰好等于上限合法
+    boundary_session = {
+        "maxWindow": 4,
+        "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 2000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+            {"direction": "server", "apdu": s_frame(1), "capturedAtUs": 1100},
+        ],
+    }
+    status, data = post(boundary_session)
+    check("时延恰好等于上限返回 200", status == 200, f"实际 {status} {data}")
+    delay = (data.get("result", {}).get("ackEvidence", {})
+             .get("client", [{}])[0].get("delayUs"))
+    check("边界时延记录为 1000 μs", delay == 1000, str(delay))
+
+    # 7. ackEvidence：确认帧到达时已超限，定位最早超时发送帧
+    late_ack = {
+        "maxWindow": 4,
+        "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 5000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+            {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 200},
+            # 同一累计确认：I0 等待 1001 μs 超时，I1 仅 901 μs
+            {"direction": "server", "apdu": s_frame(2), "capturedAtUs": 1101},
+        ],
+    }
+    status, data = post(late_ack)
+    err = data.get("error", {})
+    check("迟到确认返回 422 I_ACK_TIMEOUT 且定位最早超时帧",
+          status == 422 and err.get("code") == "I_ACK_TIMEOUT"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 8. ackEvidence：截至 captureEndAtUs 仍未确认且已超限
+    end_timeout = {
+        "maxWindow": 4,
+        "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 1201},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+            {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 200},
+            {"direction": "server", "apdu": s_frame(1), "capturedAtUs": 300},
+            # I1(下标3) 始终未确认，到 1201 已等待 1001 μs
+        ],
+    }
+    status, data = post(end_timeout)
+    err = data.get("error", {})
+    check("结束时未确认且超限返回 422 I_ACK_TIMEOUT（下标 3）",
+          status == 422 and err.get("code") == "I_ACK_TIMEOUT"
+          and err.get("frameIndex") == 3,
+          f"{status} {err}")
+
+    # 9. ackEvidence：启用后缺时间戳属请求结构错误
+    missing_ts = {
+        "maxWindow": 4,
+        "ackEvidence": {"maxDelayUs": 1000, "captureEndAtUs": 100},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON},
+        ],
+    }
+    status, data = post(missing_ts)
+    err = data.get("error", {})
+    check("启用证据后缺 capturedAtUs 返回 400 INVALID_REQUEST",
+          status == 400 and err.get("code") == "INVALID_REQUEST"
+          and err.get("frameIndex") == 1,
+          f"{status} {err}")
+
     print("全部冒烟通过")
     return 0
 

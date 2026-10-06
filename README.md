@@ -25,8 +25,11 @@
 | `frames` | 1–5000 帧，按 `capturedAtUs` 非递减排列 |
 | `frames[].direction` | `"client"`（主站）或 `"server"`（子站），也接受 `master`/`slave`、`primary`/`secondary` 等别名 |
 | `frames[].apdu` | 完整十六进制 APDU（起始符 0x68 + 长度 + 4 字节控制域 [+ ASDU]，允许空白分隔） |
-| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳 |
+| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳；启用 `ackEvidence` 时**每帧必填** |
 | `maxWindow` | 最大未确认窗口，1–16383 |
+| `ackEvidence` | 可选。单帧确认及时性证据；省略时本字段以外的既有契约完全不变 |
+| `ackEvidence.maxDelayUs` | 必填，整数 `1`–`60000000` μs，单帧确认时延上限（恰好等于上限合法） |
+| `ackEvidence.captureEndAtUs` | 可选，非负整数微秒抓包结束时刻，不得早于末帧的 `capturedAtUs` |
 
 成功响应（200）：
 
@@ -45,9 +48,32 @@
 }
 ```
 
+启用 `ackEvidence` 后，`result` 额外按方向返回每个**已确认** I 帧的证据：
+
+```json
+{
+  "ackEvidence": {
+    "client": [
+      { "sendFrameIndex": 2, "firstAckFrameIndex": 4, "delayUs": 200 },
+      { "sendFrameIndex": 3, "firstAckFrameIndex": 4, "delayUs": 100 }
+    ],
+    "server": [
+      { "sendFrameIndex": 4, "firstAckFrameIndex": 5, "delayUs": 100 }
+    ]
+  }
+}
+```
+
 - `iFrames`：按方向统计 I 帧数。
 - `outstanding`：会话结束时各方向已发送但尚未被对端确认的 I 帧数。
 - `handshakes`：三类 U 格式服务的 act、con 总数及成功反向配对次数。
+- `ackEvidence`（仅启用时）：
+  - 对端 I 或 S 帧的 N(R) **首次越过**某发送序号（即 N(R) 由 `n` 增至 `>n`）时，
+    认定该发送 I 帧获得确认；`firstAckFrameIndex` 为该确认帧下标，
+    `delayUs = 确认帧 capturedAtUs − 发送帧 capturedAtUs`。
+  - 同一次累计确认（含 I 帧捎带 N(R)）覆盖多帧时，每个被覆盖的发送帧分别
+    形成一条证据，均指向同一个 `firstAckFrameIndex` 但时延各自独立可复核。
+  - 仅列已确认帧；证据按发送顺序排列。未确认帧不列入，但仍计入 `outstanding`。
 
 失败响应（4xx），`frameIndex` 为**最早受影响帧**的 0 基下标，`message`
 只描述该帧本身，不包含对后续帧的裁决：
@@ -74,6 +100,7 @@
 | `HANDSHAKE_UNMATCHED` | 422 | act/con 缺少配对、同方向配对、con 无对应 act，或会话结束仍有 act 未配对（定位到该 act） |
 | `HANDSHAKE_OVERLAP` | 422 | 上一个同类 act 尚未收到 con 又出现新的 act |
 | `I_FRAME_OUTSIDE_PHASE` | 422 | I 帧出现在 STARTDT 确认之前或 STOPDT 确认之后 |
+| `I_ACK_TIMEOUT` | 422 | 仅启用 `ackEvidence` 时：确认帧到达时 `delayUs > maxDelayUs`，或提供了 `captureEndAtUs` 而某 I 帧截至该时刻仍未确认且 `captureEndAtUs − 发送时刻 > maxDelayUs`；`frameIndex` 为最早超时的发送帧下标 |
 
 ### 核验规则要点
 
@@ -83,6 +110,9 @@
 - STARTDT/STOPDT/TESTFR 的 act 与 con 必须来自相反方向；同类 act 未确认前
   不得重发；会话结束仍悬挂的 act，定位到最早的那一帧。
 - S 帧与 TESTFR 可在任意阶段出现；STARTDT con 之后、STOPDT con 之前才允许 I 帧。
+- 启用 `ackEvidence` 后所有帧必须携带 `capturedAtUs`；N(R) 首次越过某发送
+  序号即计时确认时延，超时（含抓包结束仍未确认）以 `I_ACK_TIMEOUT` 定位到
+  最早超时的发送帧，时延恰好等于 `maxDelayUs` 合法。
 
 ## 运行
 
@@ -122,7 +152,7 @@ app/
   protocol.py      # APDU 解析与会话状态机（核心）
   main.py          # 标准库 HTTP 服务
   healthcheck.py   # 容器健康检查探针
-tests/             # 57 个单元 + HTTP 集成测试
+tests/             # 86 个单元 + HTTP 集成测试
 verify/
   run.sh           # 一次性核验编排
   smoke.py         # 合法/非法会话 HTTP 冒烟
