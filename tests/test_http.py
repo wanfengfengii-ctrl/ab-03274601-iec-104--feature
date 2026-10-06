@@ -26,6 +26,11 @@ def i_frame(send: int, recv: int = 0) -> str:
     return (bytes([0x68, len(body)]) + body).hex()
 
 
+def s_frame(recv: int) -> str:
+    body = bytes([0x01, 0x00, (recv << 1) & 0xFF, (recv << 1) >> 8])
+    return (bytes([0x68, 4]) + body).hex()
+
+
 class HttpServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -126,6 +131,65 @@ class HttpServerTest(unittest.TestCase):
 
     def test_bad_request_body_400(self):
         status, data = self._post({"frames": [], "maxWindow": 4})
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+
+    def test_ack_evidence_success(self):
+        body = {
+            "maxWindow": 8,
+            "ackEvidence": {"maxDelayUs": 100, "captureEndAtUs": 220},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 10},
+                {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+                {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 110},
+                {"direction": "server", "apdu": i_frame(0, 2), "capturedAtUs": 200},
+                {"direction": "client", "apdu": s_frame(1), "capturedAtUs": 220},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 200)
+        result = data["result"]
+        self.assertEqual(result["iFrames"], {"client": 2, "server": 1})
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [
+                {"sendIndex": 2, "ackIndex": 4, "delayUs": 100},
+                {"sendIndex": 3, "ackIndex": 4, "delayUs": 90},
+            ],
+        )
+        self.assertEqual(
+            result["ackEvidence"]["server"],
+            [{"sendIndex": 4, "ackIndex": 5, "delayUs": 20}],
+        )
+
+    def test_ack_evidence_timeout_422(self):
+        body = {
+            "maxWindow": 8,
+            "ackEvidence": {"maxDelayUs": 100, "captureEndAtUs": 1000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 10},
+                {"direction": "client", "apdu": i_frame(0, 0), "capturedAtUs": 100},
+                {"direction": "server", "apdu": s_frame(1), "capturedAtUs": 150},
+                {"direction": "client", "apdu": i_frame(1, 0), "capturedAtUs": 160},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 422)
+        self.assertEqual(data["error"]["code"], "I_ACK_TIMEOUT")
+        self.assertEqual(data["error"]["frameIndex"], 4)
+
+    def test_ack_evidence_bad_param_400(self):
+        body = {
+            "maxWindow": 8,
+            "ackEvidence": {"maxDelayUs": 0, "captureEndAtUs": 10},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 10},
+            ],
+        }
+        status, data = self._post(body)
         self.assertEqual(status, 400)
         self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
 

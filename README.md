@@ -25,8 +25,11 @@
 | `frames` | 1–5000 帧，按 `capturedAtUs` 非递减排列 |
 | `frames[].direction` | `"client"`（主站）或 `"server"`（子站），也接受 `master`/`slave`、`primary`/`secondary` 等别名 |
 | `frames[].apdu` | 完整十六进制 APDU（起始符 0x68 + 长度 + 4 字节控制域 [+ ASDU]，允许空白分隔） |
-| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳 |
+| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳；启用 `ackEvidence` 时每一帧都必须提供 |
 | `maxWindow` | 最大未确认窗口，1–16383 |
+| `ackEvidence` | 可选；启用逐帧确认时延取证，省略时请求与响应契约保持原样 |
+| `ackEvidence.maxDelayUs` | 确认时延上限（微秒），1–60000000；时延恰好等于上限合法 |
+| `ackEvidence.captureEndAtUs` | 捕获结束时间（微秒），不得早于末帧 `capturedAtUs` |
 
 成功响应（200）：
 
@@ -40,6 +43,10 @@
       "STARTDT": { "act": 1, "con": 1, "paired": 1 },
       "STOPDT":  { "act": 1, "con": 1, "paired": 1 },
       "TESTFR":  { "act": 0, "con": 0, "paired": 0 }
+    },
+    "ackEvidence": {
+      "client": [ { "sendIndex": 2, "ackIndex": 5, "delayUs": 100 } ],
+      "server": []
     }
   }
 }
@@ -48,6 +55,10 @@
 - `iFrames`：按方向统计 I 帧数。
 - `outstanding`：会话结束时各方向已发送但尚未被对端确认的 I 帧数。
 - `handshakes`：三类 U 格式服务的 act、con 总数及成功反向配对次数。
+- `ackEvidence`：仅在请求携带 `ackEvidence` 时返回。按发送方向列出每个
+  **已确认** I 帧的证据：`sendIndex`（发送帧下标）、`ackIndex`（首次确认它的
+  对端 I/S 帧下标）、`delayUs`（两帧 `capturedAtUs` 之差）。同一累计确认覆盖
+  多个 I 帧时，每帧各自成条（`ackIndex` 相同），均可独立复核。
 
 失败响应（4xx），`frameIndex` 为**最早受影响帧**的 0 基下标，`message`
 只描述该帧本身，不包含对后续帧的裁决：
@@ -74,6 +85,7 @@
 | `HANDSHAKE_UNMATCHED` | 422 | act/con 缺少配对、同方向配对、con 无对应 act，或会话结束仍有 act 未配对（定位到该 act） |
 | `HANDSHAKE_OVERLAP` | 422 | 上一个同类 act 尚未收到 con 又出现新的 act |
 | `I_FRAME_OUTSIDE_PHASE` | 422 | I 帧出现在 STARTDT 确认之前或 STOPDT 确认之后 |
+| `I_ACK_TIMEOUT` | 422 | 启用 `ackEvidence` 后，I 帧确认到达时时延超过 `maxDelayUs`，或截至 `captureEndAtUs` 仍未确认且已超限；`frameIndex` 为最早超时的发送帧 |
 
 ### 核验规则要点
 
@@ -83,6 +95,10 @@
 - STARTDT/STOPDT/TESTFR 的 act 与 con 必须来自相反方向；同类 act 未确认前
   不得重发；会话结束仍悬挂的 act，定位到最早的那一帧。
 - S 帧与 TESTFR 可在任意阶段出现；STARTDT con 之后、STOPDT con 之前才允许 I 帧。
+- 启用 `ackEvidence` 时，对端 I/S 帧的 N(R) 首次越过某发送序号即认定该 I 帧
+  获确认，按两帧 `capturedAtUs` 之差计时：确认到达时已超限，或截至
+  `captureEndAtUs` 仍未确认且已超限，均判 `I_ACK_TIMEOUT` 并定位下标最早的
+  超时发送帧；时延恰好等于 `maxDelayUs` 合法。
 
 ## 运行
 
@@ -102,7 +118,9 @@ PORT=8080 python3 app/main.py
 ## 一次性核验服务 verify
 
 `verify` 服务在清洁启动后依次执行：单元/集成测试 → 等待 API 健康检查通过 →
-合法会话与多类非法会话冒烟，最终以退出码报告（0 成功，非 0 失败）：
+合法会话与多类非法会话冒烟（含旧契约不含 `ackEvidence`、累计及捎带确认逐帧
+成证、边界时延合法、确认到达超时与结束超时场景），最终以退出码报告
+（0 成功，非 0 失败）：
 
 ```bash
 docker compose up --build --force-recreate --exit-code-from verify verify
@@ -122,7 +140,7 @@ app/
   protocol.py      # APDU 解析与会话状态机（核心）
   main.py          # 标准库 HTTP 服务
   healthcheck.py   # 容器健康检查探针
-tests/             # 57 个单元 + HTTP 集成测试
+tests/             # 74 个单元 + HTTP 集成测试
 verify/
   run.sh           # 一次性核验编排
   smoke.py         # 合法/非法会话 HTTP 冒烟

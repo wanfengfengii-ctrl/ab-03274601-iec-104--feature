@@ -387,6 +387,195 @@ class ViolationTests(unittest.TestCase):
         expect_error(frames, ErrorCode.FRAMES_NOT_ORDERED, 4, window=2)
 
 
+class AckEvidenceTests(unittest.TestCase):
+    """ackEvidence 逐帧确认时延取证。"""
+
+    def _started(self, t0=0, t1=10):
+        return [f("client", STARTDT_ACT, t0), f("server", STARTDT_CON, t1)]
+
+    def audit_ack(self, frames, max_delay, capture_end, window=12):
+        return audit_request({
+            "frames": frames,
+            "maxWindow": window,
+            "ackEvidence": {
+                "maxDelayUs": max_delay,
+                "captureEndAtUs": capture_end,
+            },
+        })
+
+    def expect_ack_timeout(self, frames, max_delay, capture_end, index, window=12):
+        try:
+            self.audit_ack(frames, max_delay, capture_end, window)
+        except AuditError as exc:
+            assert exc.code is ErrorCode.I_ACK_TIMEOUT, f"实际 {exc.code}"
+            assert exc.frame_index == index, (
+                f"期望下标 {index}，实际 {exc.frame_index}（{exc.message}）"
+            )
+            return exc
+        raise AssertionError("应当抛出 I_ACK_TIMEOUT，但核验通过了")
+
+    def test_old_contract_omits_ack_evidence(self):
+        frames = self._started(1, 2) + [
+            f("client", i_frame(0, 0), 3),
+            f("server", s_frame(1), 4),
+        ]
+        self.assertNotIn("ackEvidence", audit(frames)["result"])
+        # 完全不带时间戳同样保持旧契约
+        bare = [
+            {"direction": "client", "apdu": STARTDT_ACT},
+            {"direction": "server", "apdu": STARTDT_CON},
+            {"direction": "client", "apdu": i_frame(0, 0)},
+            {"direction": "server", "apdu": s_frame(1)},
+        ]
+        self.assertNotIn("ackEvidence", audit(bare)["result"])
+
+    def test_piggyback_and_cumulative_ack_evidence(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 110),
+            f("client", i_frame(2, 0), 120),
+            f("server", i_frame(0, 2), 200),  # 捎带并累计确认 client 的 I0、I1
+            f("server", s_frame(3), 215),     # 确认 client 的 I2
+            f("client", s_frame(1), 220),     # 确认 server 的 I0
+        ]
+        result = self.audit_ack(frames, 100, 220)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [
+                {"sendIndex": 2, "ackIndex": 5, "delayUs": 100},  # 恰等于上限
+                {"sendIndex": 3, "ackIndex": 5, "delayUs": 90},
+                {"sendIndex": 4, "ackIndex": 6, "delayUs": 95},
+            ],
+        )
+        self.assertEqual(
+            result["ackEvidence"]["server"],
+            [{"sendIndex": 5, "ackIndex": 7, "delayUs": 20}],
+        )
+        # 原统计保持不变
+        self.assertEqual(result["iFrames"], {"client": 3, "server": 1})
+        self.assertEqual(result["outstanding"], {"client": 0, "server": 0})
+
+    def test_delay_equal_to_limit_is_legal(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 200),  # 时延恰好 100 微秒
+        ]
+        result = self.audit_ack(frames, 100, 200)["result"]
+        self.assertEqual(
+            result["ackEvidence"]["client"],
+            [{"sendIndex": 2, "ackIndex": 3, "delayUs": 100}],
+        )
+
+    def test_ack_arrival_timeout_reports_send_frame(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 201),  # 确认到达时时延 101 > 100
+        ]
+        exc = self.expect_ack_timeout(frames, 100, 201, 2)
+        self.assertIn("101", exc.message)
+
+    def test_earliest_timeout_across_directions(self):
+        frames = self._started(0, 10) + [
+            f("server", i_frame(0, 0), 20),
+            f("client", i_frame(0, 0), 30),
+            f("server", s_frame(1), 200),  # client I0 时延 170，超时（下标 3）
+            f("client", s_frame(1), 300),  # server I0 时延 280，超时（下标 2）
+        ]
+        # 两个方向均有超时，定位下标最早的发送帧
+        self.expect_ack_timeout(frames, 100, 300, 2)
+
+    def test_end_of_capture_timeout(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("server", s_frame(1), 150),
+            f("client", i_frame(1, 0), 160),  # 至捕获结束未确认，等待 840 > 100
+        ]
+        exc = self.expect_ack_timeout(frames, 100, 1000, 4)
+        self.assertIn("840", exc.message)
+
+    def test_end_of_capture_reports_earliest_unacked(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 110),  # 两帧均未确认，定位最早的 I0
+        ]
+        self.expect_ack_timeout(frames, 100, 1000, 2)
+
+    def test_unacked_within_limit_at_capture_end(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),
+            f("client", i_frame(1, 0), 150),  # 未确认但仅等待 50，未超限
+        ]
+        result = self.audit_ack(frames, 100, 200)["result"]
+        # 未确认帧不形成证据
+        self.assertEqual(result["ackEvidence"], {"client": [], "server": []})
+
+    def test_unacked_equal_to_limit_at_capture_end(self):
+        frames = self._started(0, 10) + [
+            f("client", i_frame(0, 0), 100),  # 未确认，等待恰好 100，合法
+        ]
+        result = self.audit_ack(frames, 100, 200)["result"]
+        self.assertEqual(result["ackEvidence"]["client"], [])
+
+    def test_no_i_frames_empty_evidence(self):
+        frames = self._started(0, 10) + [
+            f("client", STOPDT_ACT, 20),
+            f("server", STOPDT_CON, 30),
+        ]
+        result = self.audit_ack(frames, 100, 30)["result"]
+        self.assertEqual(result["ackEvidence"], {"client": [], "server": []})
+
+    def test_capture_end_must_cover_last_frame(self):
+        frames = self._started(0, 10) + [f("client", i_frame(0, 0), 100)]
+        with self.assertRaises(AuditError) as cm:
+            self.audit_ack(frames, 100, 99)  # 早于末帧
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        self.audit_ack(frames, 100, 100)  # 等于末帧时间戳，合法
+
+    def test_all_frames_need_timestamp_when_enabled(self):
+        frames = self._started(0, 10)
+        frames.append({"direction": "client", "apdu": i_frame(0, 0)})
+        with self.assertRaises(AuditError) as cm:
+            self.audit_ack(frames, 100, 100)
+        self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        self.assertEqual(cm.exception.frame_index, 2)
+
+    def test_ordering_still_enforced_when_enabled(self):
+        frames = [f("client", STARTDT_ACT, 10), f("server", STARTDT_CON, 5)]
+        try:
+            self.audit_ack(frames, 100, 100)
+        except AuditError as exc:
+            self.assertEqual(exc.code, ErrorCode.FRAMES_NOT_ORDERED)
+            self.assertEqual(exc.frame_index, 1)
+        else:
+            raise AssertionError("应当抛出 FRAMES_NOT_ORDERED")
+
+    def test_ack_evidence_param_validation(self):
+        base = {"frames": self._started(0, 10), "maxWindow": 12}
+        for bad in ("x", [], 100):
+            with self.assertRaises(AuditError) as cm:
+                audit_request({**base, "ackEvidence": bad})
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        for bad_delay in (0, 60000001, 1.5, True, "100"):
+            with self.assertRaises(AuditError) as cm:
+                audit_request({**base, "ackEvidence": {
+                    "maxDelayUs": bad_delay, "captureEndAtUs": 10}})
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        for bad_end in (-1, 1.5, False, "10"):
+            with self.assertRaises(AuditError) as cm:
+                audit_request({**base, "ackEvidence": {
+                    "maxDelayUs": 100, "captureEndAtUs": bad_end}})
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        for missing in ({"maxDelayUs": 100}, {"captureEndAtUs": 10}, {}):
+            with self.assertRaises(AuditError) as cm:
+                audit_request({**base, "ackEvidence": missing})
+            self.assertEqual(cm.exception.code, ErrorCode.INVALID_REQUEST)
+        # 边界值合法
+        audit_request({**base, "ackEvidence": {
+            "maxDelayUs": 1, "captureEndAtUs": 10}})
+        audit_request({**base, "ackEvidence": {
+            "maxDelayUs": 60000000, "captureEndAtUs": 10}})
+
+
 class RequestValidationTests(unittest.TestCase):
     def test_empty_frames(self):
         with self.assertRaises(AuditError) as cm:
