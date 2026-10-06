@@ -1,0 +1,45 @@
+# IEC 104 会话取证核验平台编排
+#
+# 宿主机端口可通过环境变量配置：
+#   HOST_PORT=9090 docker compose up --build
+# 镜像仓库标签也可覆盖：
+#   IMAGE_TAG=dev docker compose up --build
+
+name: iec104-audit
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iec104-audit:${IMAGE_TAG:-latest}
+    environment:
+      PORT: 8080
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+    ports:
+      # 宿主机端口 ${HOST_PORT:-8080} -> 容器内 8080，可用 .env 或环境变量覆盖
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "/srv/app/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    # 一次性服务：清洁启动后核对单元测试、镜像构建与合法/非法会话冒烟，
+    # 以退出码报告结果（0 成功）。
+    #   docker compose up --build --exit-code-from verify verify
+    image: iec104-audit:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["bash", "verify/run.sh"]
+    environment:
+      API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
